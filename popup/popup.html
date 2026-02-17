@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <!-- View 1: Configuration -->
+  <div id="configView" class="container">
+    <h1>TabUnhoarder</h1>
+
+    <div class="field">
+      <label for="keepUrls">URLs to keep (one per line)</label>
+      <textarea id="keepUrls" rows="3" placeholder="https://mail.google.com&#10;https://docs.google.com"></textarea>
+      <label class="checkbox-label field-option">
+        <input type="checkbox" id="regexKeep">
+        Regex
+      </label>
+    </div>
+
+    <div class="field">
+      <label for="removeUrls">URLs to remove (one per line)</label>
+      <textarea id="removeUrls" rows="3" placeholder="https://example.com&#10;https://old-site.com"></textarea>
+      <label class="checkbox-label field-option">
+        <input type="checkbox" id="regexRemove">
+        Regex
+      </label>
+    </div>
+
+    <div class="options">
+      <label class="checkbox-label">
+        <input type="checkbox" id="onlyThisWindow">
+        Only this window
+      </label>
+      <label class="checkbox-label">
+        <input type="checkbox" id="reviewBeforeClose" checked>
+        Review before closing
+      </label>
+    </div>
+
+    <button id="findTabsBtn" class="btn-primary">Find Tabs</button>
+
+    <div id="configStatus" class="status" hidden></div>
+  </div>
+
+  <!-- View 2: Confirmation -->
+  <div id="confirmView" class="container hidden">
+    <div class="confirm-header">
+      <h1 id="confirmTitle">Tabs to close</h1>
+      <a href="#" id="toggleSelectAll" class="toggle-link">Deselect All</a>
+    </div>
+
+    <div id="tabList" class="tab-list"></div>
+
+    <div class="confirm-actions">
+      <button id="closeSelectedBtn" class="btn-primary">Close Selected</button>
+      <button id="backBtn" class="btn-secondary">Back</button>
+    </div>
+
+    <div id="confirmStatus" class="status" hidden></div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
