@@ -48,14 +48,63 @@ document.addEventListener("DOMContentLoaded", async () => {
     return /^https?:\/\//.test(pattern);
   }
 
+  const MAX_REGEX_LENGTH = 200;
+
+  function hasNestedQuantifiers(pattern) {
+    // Detect patterns that cause catastrophic backtracking:
+    // (a+)+, (a*)+, (a?)+, (\w+)*, (\d*)+ etc.
+    // Walks the string tracking whether each group contains a quantifier,
+    // then checks if the group itself is quantified.
+    const groupStack = [];
+    let hasQuantifierInGroup = false;
+    for (let i = 0; i < pattern.length; i++) {
+      const ch = pattern[i];
+      if (ch === "\\") {
+        // Escaped char — skip it but don't skip quantifier detection.
+        // \d, \w, \s etc. are matchable atoms, not literal chars to ignore.
+        i++;
+        continue;
+      }
+      if (ch === "[") {
+        // Skip character classes entirely — content inside [] is not quantifiable
+        while (i < pattern.length && pattern[i] !== "]") {
+          if (pattern[i] === "\\") i++;
+          i++;
+        }
+        continue;
+      }
+      if (ch === "(") {
+        groupStack.push(hasQuantifierInGroup);
+        hasQuantifierInGroup = false;
+      } else if (ch === ")") {
+        const groupHadQuantifier = hasQuantifierInGroup;
+        hasQuantifierInGroup = groupStack.pop() || false;
+        const next = pattern[i + 1];
+        if (groupHadQuantifier && (next === "+" || next === "*" || next === "?" || next === "{")) {
+          return true;
+        }
+      } else if (ch === "+" || ch === "*" || ch === "?") {
+        hasQuantifierInGroup = true;
+      } else if (ch === "{" && /^\{\d+,\d*\}/.test(pattern.slice(i))) {
+        hasQuantifierInGroup = true;
+      }
+    }
+    return false;
+  }
+
   function buildMatcher(pattern, isRegex) {
     if (isRegex) {
+      if (pattern.length > MAX_REGEX_LENGTH) {
+        return { error: `Pattern too long (${pattern.length} chars, max ${MAX_REGEX_LENGTH})` };
+      }
+      if (hasNestedQuantifiers(pattern)) {
+        return { error: "Pattern rejected — nested quantifiers can cause hangs" };
+      }
       try {
         const re = new RegExp(pattern);
         return (url) => re.test(url) || re.test(stripProtocol(url));
       } catch (e) {
-        console.warn(`TabUnhoarder: invalid regex "${pattern}" — ${e.message}`);
-        return null;
+        return { error: `Invalid regex — ${e.message}` };
       }
     }
     if (hasProtocol(pattern)) {
@@ -64,12 +113,22 @@ document.addEventListener("DOMContentLoaded", async () => {
     return (url) => stripProtocol(url).startsWith(pattern);
   }
 
-  function shouldIncludeTab(url, keepPatterns, keepMatchers, removeMatchers) {
-    // Keep always wins — check exact match first, then regex/prefix
-    const urlBare = stripProtocol(url);
-    if (keepPatterns.some((p) => url === p || urlBare === p)) {
-      return false;
+  function buildMatchers(patterns, isRegex) {
+    const matchers = [];
+    const errors = [];
+    for (const p of patterns) {
+      const result = buildMatcher(p, isRegex);
+      if (typeof result === "function") {
+        matchers.push(result);
+      } else if (result && result.error) {
+        errors.push(`"${p}": ${result.error}`);
+      }
     }
+    return { matchers, errors };
+  }
+
+  function shouldIncludeTab(url, keepMatchers, removeMatchers) {
+    // Keep always wins
     if (keepMatchers.some((matcher) => matcher(url))) {
       return false;
     }
@@ -92,23 +151,33 @@ document.addEventListener("DOMContentLoaded", async () => {
   }
 
   async function saveSettings() {
-    await browser.storage.local.set({
-      [STORAGE_KEY]: {
-        keepUrls: keepUrlsEl.value,
-        removeUrls: removeUrlsEl.value,
-        regexKeep: regexKeepEl.checked,
-        regexRemove: regexRemoveEl.checked,
-        onlyThisWindow: onlyThisWindowEl.checked,
-        reviewBeforeClose: reviewBeforeCloseEl.checked,
-      },
-    });
+    try {
+      await browser.storage.local.set({
+        [STORAGE_KEY]: {
+          keepUrls: keepUrlsEl.value,
+          removeUrls: removeUrlsEl.value,
+          regexKeep: regexKeepEl.checked,
+          regexRemove: regexRemoveEl.checked,
+          onlyThisWindow: onlyThisWindowEl.checked,
+          reviewBeforeClose: reviewBeforeCloseEl.checked,
+        },
+      });
+    } catch (err) {
+      console.error("TabUnhoarder: failed to save settings:", err);
+    }
   }
 
   const debouncedSave = debounce(saveSettings, 300);
 
   // --- View Switching ---
 
+  let returnToConfigTimer = null;
+
   function showConfigView() {
+    if (returnToConfigTimer) {
+      clearTimeout(returnToConfigTimer);
+      returnToConfigTimer = null;
+    }
     confirmView.classList.add("hidden");
     configView.classList.remove("hidden");
     tabListEl.innerHTML = "";
@@ -119,9 +188,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     configView.classList.add("hidden");
     confirmView.classList.remove("hidden");
 
-    const count = tabs.length;
-    const noun = count === 1 ? "tab" : "tabs";
-    confirmTitleEl.textContent = `Tabs to close (${count})`;
+    confirmTitleEl.textContent = `Tabs to close (${tabs.length})`;
     toggleSelectAllEl.textContent = "Deselect All";
 
     renderTabList(tabs);
@@ -142,8 +209,9 @@ document.addEventListener("DOMContentLoaded", async () => {
       checkbox.dataset.tabId = tab.id;
       checkbox.addEventListener("change", updateCloseButtonLabel);
 
+      const safeFavIcon = tab.favIconUrl && /^(https?:|data:|moz-extension:)/.test(tab.favIconUrl);
       let iconEl;
-      if (tab.favIconUrl) {
+      if (safeFavIcon) {
         iconEl = document.createElement("img");
         iconEl.className = "tab-favicon";
         iconEl.src = tab.favIconUrl;
@@ -193,62 +261,67 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   function updateCloseButtonLabel() {
     const count = getCheckedTabIds().length;
-    const noun = count === 1 ? "tab" : "tabs";
     closeSelectedBtnEl.textContent = `Close Selected (${count})`;
   }
 
   // --- Status ---
 
+  const statusTimers = new WeakMap();
+
   function showStatus(el, message) {
+    const prev = statusTimers.get(el);
+    if (prev) clearTimeout(prev);
+
     el.textContent = message;
     el.hidden = false;
-    setTimeout(() => {
+    statusTimers.set(el, setTimeout(() => {
       el.hidden = true;
-    }, 4000);
+      statusTimers.delete(el);
+    }, 4000));
   }
 
   // --- Find Button Label ---
 
-  const FIND_LABEL = "Find Tabs";
-
-  async function updateFindButtonLabel() {
-    if (reviewBeforeCloseEl.checked) {
-      findTabsBtnEl.textContent = FIND_LABEL;
-      return;
-    }
-
-    const removePatterns = parsePatterns(removeUrlsEl.value);
-    if (removePatterns.length === 0) {
-      findTabsBtnEl.textContent = "Close Tabs";
-      return;
-    }
-
-    const keepPatterns = parsePatterns(keepUrlsEl.value);
-    const keepMatchers = keepPatterns
-      .map((p) => buildMatcher(p, regexKeepEl.checked))
-      .filter(Boolean);
-    const removeMatchers = removePatterns
-      .map((p) => buildMatcher(p, regexRemoveEl.checked))
-      .filter(Boolean);
-
-    if (removeMatchers.length === 0) {
-      findTabsBtnEl.textContent = "Close Tabs";
-      return;
-    }
-
-    const queryOptions = onlyThisWindowEl.checked
-      ? { currentWindow: true }
-      : {};
-    const tabs = await browser.tabs.query(queryOptions);
-    const count = tabs.filter(
-      (tab) => tab.url && !tab.pinned && shouldIncludeTab(tab.url, keepPatterns, keepMatchers, removeMatchers)
-    ).length;
-
-    const noun = count === 1 ? "tab" : "tabs";
-    findTabsBtnEl.textContent = count > 0 ? `Close ${count} ${noun}` : "Close Tabs";
+  function updateFindButtonLabel() {
+    findTabsBtnEl.textContent = reviewBeforeCloseEl.checked ? "Find Tabs" : "Close Tabs";
   }
 
-  const debouncedUpdateLabel = debounce(updateFindButtonLabel, 300);
+  // --- Window safety ---
+
+  function safeTabIds(tabIds, allTabs) {
+    // Ensure at least one tab remains open per window to prevent window closure
+    const tabsById = new Map(allTabs.map((t) => [t.id, t]));
+    const closingSet = new Set(tabIds.filter((id) => tabsById.has(id)));
+
+    // Count remaining tabs per window after proposed closure
+    const windowTabCounts = new Map();
+    for (const tab of allTabs) {
+      const wid = tab.windowId;
+      if (!windowTabCounts.has(wid)) windowTabCounts.set(wid, 0);
+      if (!closingSet.has(tab.id)) {
+        windowTabCounts.set(wid, windowTabCounts.get(wid) + 1);
+      }
+    }
+
+    // Find which windows would become empty
+    const emptyWindows = new Set();
+    for (const [wid, remaining] of windowTabCounts) {
+      if (remaining === 0) emptyWindows.add(wid);
+    }
+
+    // For each empty window, spare one tab
+    const sparedWindows = new Set();
+    const safe = [];
+    for (const id of closingSet) {
+      const wid = tabsById.get(id)?.windowId;
+      if (emptyWindows.has(wid) && !sparedWindows.has(wid)) {
+        sparedWindows.add(wid);
+        continue;
+      }
+      safe.push(id);
+    }
+    return safe;
+  }
 
   // --- Find Tabs ---
 
@@ -262,16 +335,23 @@ document.addEventListener("DOMContentLoaded", async () => {
 
     const keepPatterns = parsePatterns(keepUrlsEl.value);
 
-    // Build matchers with independent regex settings
-    const keepMatchers = keepPatterns
-      .map((p) => buildMatcher(p, regexKeepEl.checked))
-      .filter(Boolean);
-    const removeMatchers = removePatterns
-      .map((p) => buildMatcher(p, regexRemoveEl.checked))
-      .filter(Boolean);
+    const keep = buildMatchers(keepPatterns, regexKeepEl.checked);
+    const remove = buildMatchers(removePatterns, regexRemoveEl.checked);
+    const allErrors = [...keep.errors, ...remove.errors];
 
-    if (removeMatchers.length === 0) {
-      showStatus(configStatusEl, "All removal patterns are invalid.");
+    if (keep.errors.length > 0 && keepPatterns.length > 0) {
+      if (keep.matchers.length === 0) {
+        showStatus(configStatusEl, `Warning: all keep patterns invalid — ${keep.errors.join("; ")}`);
+        return;
+      }
+      // Some keep patterns failed — warn but continue with valid ones
+      console.warn("TabUnhoarder: some keep patterns invalid:", keep.errors);
+    }
+
+    if (remove.matchers.length === 0) {
+      showStatus(configStatusEl, allErrors.length > 0
+        ? `Invalid patterns: ${allErrors.join("; ")}`
+        : "All removal patterns are invalid.");
       return;
     }
 
@@ -281,7 +361,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     const tabs = await browser.tabs.query(queryOptions);
 
     const matchingTabs = tabs.filter(
-      (tab) => tab.url && !tab.pinned && shouldIncludeTab(tab.url, keepPatterns, keepMatchers, removeMatchers)
+      (tab) => tab.url && !tab.pinned && !tab.active && shouldIncludeTab(tab.url, keep.matchers, remove.matchers)
     );
 
     if (matchingTabs.length === 0) {
@@ -292,19 +372,38 @@ document.addEventListener("DOMContentLoaded", async () => {
     if (reviewBeforeCloseEl.checked) {
       showConfirmView(matchingTabs);
     } else {
-      const tabIds = matchingTabs.map((tab) => tab.id);
-      await browser.tabs.remove(tabIds);
-      const noun = tabIds.length === 1 ? "tab" : "tabs";
-      showStatus(configStatusEl, `Closed ${tabIds.length} ${noun}.`);
+      const candidateIds = matchingTabs.map((tab) => tab.id);
+      const result = await closeTabs(candidateIds);
+      showStatus(configStatusEl, result);
     }
+  }
+
+  // --- Close Tabs (shared) ---
+
+  async function closeTabs(candidateIds) {
+    const allTabs = await browser.tabs.query({});
+    const tabIds = safeTabIds(candidateIds, allTabs);
+    if (tabIds.length === 0) {
+      return "Cannot close — it would leave a window empty.";
+    }
+
+    const results = await Promise.allSettled(tabIds.map((id) => browser.tabs.remove(id)));
+    const closed = results.filter((r) => r.status === "fulfilled").length;
+    const failed = results.length - closed;
+
+    const skipped = candidateIds.length - tabIds.length;
+    let msg = `Closed ${closed} tab${closed !== 1 ? "s" : ""}.`;
+    if (failed > 0) msg += ` ${failed} already gone.`;
+    if (skipped > 0) msg += ` Kept ${skipped} to avoid empty window${skipped !== 1 ? "s" : ""}.`;
+    return msg;
   }
 
   // --- Close Selected ---
 
   async function closeSelected() {
-    const tabIds = getCheckedTabIds();
+    const candidateIds = getCheckedTabIds();
 
-    if (tabIds.length === 0) {
+    if (candidateIds.length === 0) {
       showStatus(confirmStatusEl, "No tabs selected.");
       return;
     }
@@ -313,10 +412,9 @@ document.addEventListener("DOMContentLoaded", async () => {
     closeSelectedBtnEl.textContent = "Closing...";
 
     try {
-      await browser.tabs.remove(tabIds);
-      const noun = tabIds.length === 1 ? "tab" : "tabs";
-      showStatus(confirmStatusEl, `Closed ${tabIds.length} ${noun}.`);
-      setTimeout(showConfigView, 1500);
+      const result = await closeTabs(candidateIds);
+      showStatus(confirmStatusEl, result);
+      returnToConfigTimer = setTimeout(showConfigView, 1500);
     } catch (err) {
       showStatus(confirmStatusEl, `Error: ${err.message}`);
       console.error("TabUnhoarder close error:", err);
@@ -345,13 +443,13 @@ document.addEventListener("DOMContentLoaded", async () => {
   // --- Event Wiring ---
 
   await restoreSettings();
-  await updateFindButtonLabel();
+  updateFindButtonLabel();
 
-  keepUrlsEl.addEventListener("input", () => { debouncedSave(); debouncedUpdateLabel(); });
-  removeUrlsEl.addEventListener("input", () => { debouncedSave(); debouncedUpdateLabel(); });
-  regexKeepEl.addEventListener("change", () => { saveSettings(); updateFindButtonLabel(); });
-  regexRemoveEl.addEventListener("change", () => { saveSettings(); updateFindButtonLabel(); });
-  onlyThisWindowEl.addEventListener("change", () => { saveSettings(); updateFindButtonLabel(); });
+  keepUrlsEl.addEventListener("input", debouncedSave);
+  removeUrlsEl.addEventListener("input", debouncedSave);
+  regexKeepEl.addEventListener("change", saveSettings);
+  regexRemoveEl.addEventListener("change", saveSettings);
+  onlyThisWindowEl.addEventListener("change", saveSettings);
   reviewBeforeCloseEl.addEventListener("change", () => { saveSettings(); updateFindButtonLabel(); });
 
   findTabsBtnEl.addEventListener("click", async () => {
@@ -364,7 +462,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       console.error("TabUnhoarder find error:", err);
     } finally {
       findTabsBtnEl.disabled = false;
-      await updateFindButtonLabel();
+      updateFindButtonLabel();
     }
   });
 
