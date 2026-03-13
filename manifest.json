@@ -4,11 +4,11 @@
   "version": "1.0.0",
   "description": "Clean up browser tabs using URL pattern matching with keep/remove lists.",
   "icons": {
-    "48": "icons/broom.svg",
-    "96": "icons/broom.svg"
+    "48": "icons/icon.png",
+    "96": "icons/icon.png"
   },
   "action": {
-    "default_icon": "icons/broom.svg",
+    "default_icon": "icons/icon.png",
     "default_title": "TabUnhoarder - Clean up tabs",
     "default_popup": "popup/popup.html"
   },
